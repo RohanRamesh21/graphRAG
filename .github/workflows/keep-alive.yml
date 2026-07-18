@@ -1,0 +1,43 @@
+name: Keep Neo4j Aura / Qdrant Cloud alive
+
+# Free-tier instances get auto-paused/deleted after a period of inactivity:
+#   - Neo4j Aura Free: paused after 72h idle, deleted after 90 days paused.
+#   - Qdrant Cloud Free: suspended after 1 week idle, deleted after 4 weeks.
+# Running daily gives comfortable margin under the tighter 72h Neo4j window, even
+# accounting for GitHub's scheduled-workflow runs sometimes firing late under load.
+#
+# NOTE: GitHub automatically disables scheduled workflows after 60 days with no
+# repository activity (commits/pushes). If this stops running, push any commit or
+# re-enable it manually from the repo's Actions tab.
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD, QDRANT_URL, QDRANT_API_KEY
+# (NEO4J_AURA_URI/NEO4J_AURA_USER/NEO4J_AURA_PASSWORD and QDRANT_CLUSTER_ENDPOINT are
+# also accepted as alternate names, matching the rest of this project's convention.)
+
+on:
+  schedule:
+    - cron: "0 12 * * *" # daily at 12:00 UTC
+  workflow_dispatch: {} # allows manually triggering a run from the Actions tab
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install minimal dependencies
+        run: pip install neo4j qdrant-client
+
+      - name: Ping Neo4j Aura + Qdrant Cloud
+        env:
+          NEO4J_URI: ${{ secrets.NEO4J_URI }}
+          NEO4J_USERNAME: ${{ secrets.NEO4J_USERNAME }}
+          NEO4J_PASSWORD: ${{ secrets.NEO4J_PASSWORD }}
+          QDRANT_URL: ${{ secrets.QDRANT_URL }}
+          QDRANT_API_KEY: ${{ secrets.QDRANT_API_KEY }}
+        run: python scripts/keep_alive.py
