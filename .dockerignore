@@ -1,0 +1,21 @@
+.venv
+.git
+.github
+__pycache__
+*.pyc
+.pytest_cache
+tests
+
+# Only data/corpus.jsonl is needed at serve time (explicitly COPY'd in the Dockerfile)
+# — raw dataset, per-passage extraction logs, and eval results are dev/eval-only.
+data/raw
+data/extraction
+data/results
+
+# Frontend has its own build/deploy (Vercel) — irrelevant to the backend image.
+web/node_modules
+web/.next
+web/.env.local
+
+# Never bake real secrets into an image layer.
+.env

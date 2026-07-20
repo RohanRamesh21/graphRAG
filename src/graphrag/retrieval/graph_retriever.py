@@ -7,28 +7,49 @@ Traversal patterns are built with every intermediate node explicitly labeled `:E
 a `:Passage` node on one side, requiring every node in the pattern to be `:Entity` is
 what keeps a "hop" strictly meaning "an extracted relation edge between two entities" —
 never an incidental co-mention hop through a passage.
+
+Every node in the chain (seed *and* every node reached after it) is degree-filtered —
+see `max_seed_entity_degree` on `GraphRetriever`. This was added after a live 429/None:
+at full corpus scale (41k+ entities), a couple of generic "hub" entities (a bare year,
+a nationality adjective — both correctly typed DATE/OTHER by extraction, just not useful
+traversal points) had degree 30-40 against an otherwise single-digit norm, and a 2-hop
+match through even one such hub made a single question's retrieval take 10s of seconds
+to minutes and return thousands of barely-relevant passages. Filtering only the seed
+cut that from 5+ minutes to 10-48s — filtering *every* hop (this file's current design)
+is what actually fixes it, since the blowup was in the intermediate node's fan-out, not
+just the seed's.
 """
 from __future__ import annotations
 
 from neo4j import Driver
 
 
-def _pattern_for_depth(depth: int) -> str:
-    segments = ["(n0:Entity)"]
+def _build_traversal_query(depth: int) -> str:
+    """Builds a chain of MATCH/WHERE stages (n0 -> n1 -> ... -> n_depth), applying the
+    degree filter to each node as soon as it's introduced so Neo4j's planner prunes
+    high-degree hubs before expanding the next hop, rather than after the fact."""
+    lines = ["MATCH (n0:Entity)", "WHERE n0.name_norm IN $seed_norms"]
     for i in range(1, depth + 1):
-        segments.append(f"-[r{i}]-(n{i}:Entity)")
-    return "".join(segments)
-
-
-def _path_names_expr(depth: int) -> str:
-    return "[" + ", ".join(f"n{i}.name" for i in range(depth + 1)) + "]"
+        lines.append(f"MATCH (n{i - 1})-[r{i}]-(n{i}:Entity)")
+        condition = f"COUNT {{ (n{i})--() }} <= $max_degree"
+        if i == depth:
+            condition += f" AND n{i}.name_norm <> n0.name_norm"
+        lines.append(f"WHERE {condition}")
+    path_expr = "[" + ", ".join(f"n{i}.name" for i in range(depth + 1)) + "]"
+    lines.append(f"WITH DISTINCT n{depth} AS reached, {path_expr} AS hop_path")
+    lines.append("MATCH (reached)<-[:MENTIONS]-(p:Passage)")
+    lines.append("RETURN DISTINCT p.id AS passage_id, p.title AS title, p.text AS text, hop_path")
+    return "\n".join(lines)
 
 
 class GraphRetriever:
-    def __init__(self, driver: Driver, database: str, hop_depth: int = 2):
+    def __init__(self, driver: Driver, database: str, hop_depth: int = 2, max_seed_entity_degree: int = 30):
         self.driver = driver
         self.database = database
         self.hop_depth = hop_depth
+        # Applied to every node encountered during traversal (seed and beyond) — see
+        # this module's docstring for why filtering only the seed wasn't enough.
+        self.max_seed_entity_degree = max_seed_entity_degree
 
     def seed_entity_norms(self, seed_passage_ids: list[str]) -> list[str]:
         if not seed_passage_ids:
@@ -36,11 +57,16 @@ class GraphRetriever:
         query = """
         MATCH (p:Passage)-[:MENTIONS]->(e:Entity)
         WHERE p.id IN $passage_ids
-        RETURN DISTINCT e.name_norm AS name_norm
+        WITH DISTINCT e
+        WHERE COUNT { (e)--() } <= $max_degree
+        RETURN e.name_norm AS name_norm
         """
 
         def _tx(tx):
-            return [r["name_norm"] for r in tx.run(query, passage_ids=seed_passage_ids)]
+            return [
+                r["name_norm"]
+                for r in tx.run(query, passage_ids=seed_passage_ids, max_degree=self.max_seed_entity_degree)
+            ]
 
         # execute_read (a managed transaction function) automatically retries on
         # transient driver errors (ServiceUnavailable, SessionExpired, etc.) with
@@ -61,17 +87,10 @@ class GraphRetriever:
         def _tx(tx) -> dict[str, dict]:
             best: dict[str, dict] = {}
             for depth in range(1, self.hop_depth + 1):
-                pattern = _pattern_for_depth(depth)
-                path_expr = _path_names_expr(depth)
-                query = f"""
-                MATCH {pattern}
-                WHERE n0.name_norm IN $seed_norms AND n{depth}.name_norm <> n0.name_norm
-                WITH DISTINCT n{depth} AS reached, {path_expr} AS hop_path
-                MATCH (reached)<-[:MENTIONS]-(p:Passage)
-                RETURN DISTINCT p.id AS passage_id, p.title AS title, p.text AS text,
-                       hop_path
-                """
-                for record in tx.run(query, seed_norms=seed_norms):
+                query = _build_traversal_query(depth)
+                for record in tx.run(
+                    query, seed_norms=seed_norms, max_degree=self.max_seed_entity_degree
+                ):
                     pid = record["passage_id"]
                     if pid not in best or depth < best[pid]["hops"]:
                         best[pid] = {

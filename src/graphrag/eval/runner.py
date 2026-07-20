@@ -2,10 +2,11 @@
 
 Resumable by construction: predictions are checkpointed one JSON line per question as
 soon as they're produced, and a re-invocation skips any question_id already present in
-that mode's results file. Three conditions halt a run cleanly instead of crashing it —
-the local Gemini daily-quota pre-check, a real 429 from the API (if GEMINI_RPD is set
-too high), and Neo4j becoming unavailable for longer than the driver's own retry budget
-— all resumable by just re-running the same command later.
+that mode's results file. Several conditions halt a run cleanly instead of crashing it:
+a DeepSeek cost-ceiling breach, the local Gemini daily-quota pre-check, a real 429 from
+the Gemini API (if GEMINI_RPD is set too high), and Neo4j becoming unavailable for
+longer than the driver's own retry budget — all resumable by just re-running the same
+command later (or, for the cost ceiling, after raising it deliberately).
 """
 from __future__ import annotations
 
@@ -17,22 +18,21 @@ from google.genai.errors import ClientError
 from neo4j.exceptions import DriverError
 
 from graphrag.config import Settings
-from graphrag.generation.gemini_client import (
-    DailyQuotaExceeded,
-    DailyQuotaTracker,
-    GeminiGenerator,
-    RpmLimiter,
-)
+from graphrag.deepseek_common import CostCeilingExceeded, SpendTracker
+from graphrag.generation.deepseek_generator import DeepSeekGenerator
+from graphrag.generation.gemini_client import DailyQuotaExceeded, DailyQuotaTracker, GeminiGenerator, RpmLimiter
 from graphrag.graph.neo4j_client import make_driver
 from graphrag.orchestration.graph import answer_question, build_graphrag_app
 from graphrag.retrieval.graph_retriever import GraphRetriever, NullGraphRetriever
 from graphrag.retrieval.hybrid import HybridRetriever
 from graphrag.retrieval.vector_retriever import VectorRetriever
-from graphrag.schemas import Passage, Prediction, SampledQuestion
+from graphrag.schemas import ExtractionUsage, Passage, Prediction, SampledQuestion
 from graphrag.vector.embedder import Embedder
 from graphrag.vector.qdrant_store import make_client
 
 logger = logging.getLogger(__name__)
+
+_OTHER_MODE = {"graphrag": "baseline", "baseline": "graphrag"}
 
 
 def _load_questions(path: Path) -> list[SampledQuestion]:
@@ -61,6 +61,18 @@ def _load_done_ids(predictions_path: Path) -> set[str]:
     return done
 
 
+def _sum_usage_cost(predictions_path: Path) -> float:
+    if not predictions_path.exists():
+        return 0.0
+    total = 0.0
+    with predictions_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                total += json.loads(line).get("usage", {}).get("cost_usd", 0.0)
+    return total
+
+
 def _reasoning_path(retrieved) -> list[str]:
     lines = []
     for r in retrieved:
@@ -73,15 +85,59 @@ def _reasoning_path(retrieved) -> list[str]:
     return lines
 
 
+def _build_generator(settings: Settings, results_dir: Path, mode: str):
+    """Returns (generator, tracker) — tracker is a SpendTracker for the DeepSeek
+    backend or a DailyQuotaTracker for the Gemini backend; `run()` checks which via
+    isinstance to report the right stats and to compute per-question cost deltas."""
+    if settings.generation_backend == "deepseek":
+        # Both eval modes (and Stage 1 extraction) draw against the SAME DeepSeek
+        # account balance, so the ceiling check must see cost from both prediction
+        # files, not just this mode's — otherwise running graphrag then baseline could
+        # together exceed the ceiling while each individually looked fine.
+        this_mode_cost = _sum_usage_cost(results_dir / f"{mode}_predictions.jsonl")
+        other_mode_cost = _sum_usage_cost(results_dir / f"{_OTHER_MODE[mode]}_predictions.jsonl")
+        starting_cost = this_mode_cost + other_mode_cost
+        spend_tracker = SpendTracker(settings.deepseek_generation_cost_ceiling_usd, starting_cost)
+        generator = DeepSeekGenerator(settings.deepseek_api_key, settings.deepseek_model, spend_tracker)
+        logger.info(
+            "[%s] Using DeepSeek (%s) for generation. Starting cumulative generation "
+            "cost (both modes): $%.4f of $%.2f ceiling.",
+            mode,
+            settings.deepseek_model,
+            starting_cost,
+            settings.deepseek_generation_cost_ceiling_usd,
+        )
+        return generator, spend_tracker
+
+    if settings.generation_backend == "gemini":
+        daily_tracker = DailyQuotaTracker(
+            results_dir / "gemini_daily_quota.json", settings.gemini_rpd, model=settings.gemini_model
+        )
+        rpm_limiter = RpmLimiter(settings.gemini_rpm)
+        generator = GeminiGenerator(
+            settings.gemini_api_key, settings.gemini_model, rpm_limiter, daily_tracker
+        )
+        return generator, daily_tracker
+
+    raise ValueError(f"Unknown generation_backend: {settings.generation_backend!r}")
+
+
+async def _generate_and_track_usage(app, question, top_k_vector, top_k_final, spend_tracker):
+    """Wraps answer_question, capturing the DeepSeek spend delta (if any) for this one
+    question so it can be checkpointed on the Prediction record. Free-tier backends
+    (spend_tracker is a DailyQuotaTracker, not a SpendTracker) simply record zero cost."""
+    cost_before = spend_tracker.cost if isinstance(spend_tracker, SpendTracker) else 0.0
+    final_state = await answer_question(app, question, top_k_vector, top_k_final)
+    cost_after = spend_tracker.cost if isinstance(spend_tracker, SpendTracker) else 0.0
+    return final_state, ExtractionUsage(cost_usd=cost_after - cost_before)
+
+
 async def run(settings: Settings, mode: str, limit: int | None = None) -> dict:
     if mode not in ("graphrag", "baseline"):
         raise ValueError(f"mode must be 'graphrag' or 'baseline', got {mode!r}")
 
     settings.results_dir.mkdir(parents=True, exist_ok=True)
     predictions_path = settings.results_dir / f"{mode}_predictions.jsonl"
-    # Shared across modes on purpose: both runs draw against the SAME Gemini account's
-    # daily quota, so they must share one counter, not one each.
-    daily_quota_path = settings.results_dir / "gemini_daily_quota.json"
 
     questions = _load_questions(settings.sample_questions_path)
     if limit is not None:
@@ -108,17 +164,17 @@ async def run(settings: Settings, mode: str, limit: int | None = None) -> dict:
     graph_retriever = (
         NullGraphRetriever()
         if mode == "baseline"
-        else GraphRetriever(driver, settings.neo4j_database, hop_depth=settings.hop_depth)
+        else GraphRetriever(
+            driver,
+            settings.neo4j_database,
+            hop_depth=settings.hop_depth,
+            max_seed_entity_degree=settings.max_seed_entity_degree,
+        )
     )
     hybrid_retriever = HybridRetriever(vector_retriever, graph_retriever, passage_lookup)
 
-    daily_tracker = DailyQuotaTracker(daily_quota_path, settings.gemini_rpd, model=settings.gemini_model)
-    rpm_limiter = RpmLimiter(settings.gemini_rpm)
-    gemini_generator = GeminiGenerator(
-        settings.gemini_api_key, settings.gemini_model, rpm_limiter, daily_tracker
-    )
-
-    app = build_graphrag_app(hybrid_retriever, gemini_generator)
+    generator, tracker = _build_generator(settings, settings.results_dir, mode)
+    app = build_graphrag_app(hybrid_retriever, generator)
 
     processed = 0
     halted = False
@@ -126,24 +182,45 @@ async def run(settings: Settings, mode: str, limit: int | None = None) -> dict:
         with predictions_path.open("a", encoding="utf-8") as out_f:
             for question in pending:
                 try:
-                    final_state = await answer_question(
-                        app, question.question, settings.top_k_vector, settings.top_k_final
+                    final_state, usage = await _generate_and_track_usage(
+                        app, question.question, settings.top_k_vector, settings.top_k_final, tracker
                     )
+                except CostCeilingExceeded as e:
+                    logger.warning(
+                        "%s — stopping this run. Re-running now will hit the same "
+                        "ceiling; raise deepseek_generation_cost_ceiling_usd to continue.",
+                        e,
+                    )
+                    halted = True
+                    break
+                except DriverError as e:
+                    # Retrieval already retries transient Neo4j errors automatically
+                    # (see GraphRetriever — execute_read/execute_write retry on
+                    # ServiceUnavailable/SessionExpired with backoff). If it still
+                    # raises here, the outage outlasted the driver's own retry budget.
+                    # A 1000-question eval can span hours; that shouldn't crash the
+                    # whole batch — halt cleanly (checkpoints up to this question are
+                    # already flushed) and let the next invocation resume once Neo4j is
+                    # reachable again.
+                    logger.warning(
+                        "Neo4j became unavailable (%s: %s) — stopping this run; "
+                        "resume later once it's reachable again (check with "
+                        "scripts/check_connections.py).",
+                        type(e).__name__,
+                        e,
+                    )
+                    halted = True
+                    break
                 except DailyQuotaExceeded as e:
+                    # Only reachable when generation_backend="gemini".
                     logger.warning("%s — stopping this run; resume later to continue.", e)
                     halted = True
                     break
                 except ClientError as e:
-                    # Our local DailyQuotaTracker is a pre-emptive estimate seeded by
-                    # GEMINI_RPD — if that's set higher than the account's actual live
-                    # quota (observed: the real free-tier cap can be far below what
-                    # Google's docs suggest, e.g. 20/day even though AI Studio/docs
-                    # implied hundreds), the real API rejects the call with a 429 after
-                    # retries are exhausted. That must halt the run cleanly too, not
-                    # crash it — a crash here would still leave already-checkpointed
-                    # questions intact (writes are flushed per-question), but every
-                    # further eval invocation deserves the same graceful resume path as
-                    # a locally-predicted quota exhaustion, not a raw traceback.
+                    # Only reachable when generation_backend="gemini": our local
+                    # DailyQuotaTracker is a pre-emptive estimate seeded by GEMINI_RPD —
+                    # if that's set higher than the account's actual live quota, the
+                    # real API rejects the call with a 429 after retries are exhausted.
                     if e.code == 429:
                         logger.warning(
                             "Gemini API rejected the call with 429 (real quota reached, "
@@ -155,24 +232,6 @@ async def run(settings: Settings, mode: str, limit: int | None = None) -> dict:
                         halted = True
                         break
                     raise
-                except DriverError as e:
-                    # Retrieval already retries transient Neo4j errors automatically
-                    # (see GraphRetriever — execute_read/execute_write retry on
-                    # ServiceUnavailable/SessionExpired with backoff). If it still
-                    # raises here, the outage outlasted the driver's own retry budget.
-                    # A 1000-question eval can span hours; that shouldn't crash the
-                    # whole batch any more than a Gemini quota hit should — halt
-                    # cleanly (checkpoints up to this question are already flushed)
-                    # and let the next invocation resume once Neo4j is reachable again.
-                    logger.warning(
-                        "Neo4j became unavailable (%s: %s) — stopping this run; "
-                        "resume later once it's reachable again (check with "
-                        "scripts/check_connections.py).",
-                        type(e).__name__,
-                        e,
-                    )
-                    halted = True
-                    break
 
                 prediction = Prediction(
                     question_id=question.question_id,
@@ -184,6 +243,7 @@ async def run(settings: Settings, mode: str, limit: int | None = None) -> dict:
                     reasoning_path=_reasoning_path(final_state["retrieved"]),
                     mode=mode,
                     retries=final_state["retries"],
+                    usage=usage,
                 )
                 out_f.write(prediction.model_dump_json() + "\n")
                 out_f.flush()
@@ -191,11 +251,16 @@ async def run(settings: Settings, mode: str, limit: int | None = None) -> dict:
     finally:
         driver.close()
 
-    return {
+    stats = {
         "mode": mode,
         "total": len(questions),
         "done_before": len(done_ids),
         "processed_this_run": processed,
-        "halted_on_daily_quota": halted,
-        "gemini_calls_today": daily_tracker.count_today,
+        "halted": halted,
+        "generation_backend": settings.generation_backend,
     }
+    if isinstance(tracker, SpendTracker):
+        stats["deepseek_generation_cumulative_cost_usd"] = tracker.cost
+    else:
+        stats["gemini_calls_today"] = tracker.count_today
+    return stats

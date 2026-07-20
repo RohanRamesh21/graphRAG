@@ -101,3 +101,7 @@ class Prediction(BaseModel):
     reasoning_path: list[str] = Field(default_factory=list)
     mode: Literal["graphrag", "baseline"] = "graphrag"
     retries: int = 0
+    # Populated only when generation used DeepSeek (pay-per-use) — stays zeroed for the
+    # free-tier Gemini/Gemma path. Lets a resumed run reseed its cumulative spend
+    # tracker accurately across both prediction files (see eval/runner.py).
+    usage: ExtractionUsage = Field(default_factory=ExtractionUsage)

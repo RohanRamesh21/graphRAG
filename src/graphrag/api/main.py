@@ -7,16 +7,20 @@ per-request.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from graphrag.config import get_settings
 from graphrag.data.build_corpus import build as build_corpus
 from graphrag.data.download import download_2wiki
+from graphrag.deepseek_common import SpendTracker
 from graphrag.extraction.run_extraction import run as run_extraction
+from graphrag.generation.deepseek_generator import DeepSeekGenerator
 from graphrag.generation.gemini_client import DailyQuotaTracker, GeminiGenerator, RpmLimiter
 from graphrag.graph.build import build_graph
 from graphrag.graph.neo4j_client import get_stats, make_driver
@@ -43,6 +47,21 @@ def _load_corpus_lookup(path) -> dict[str, Passage]:
     return lookup
 
 
+def _sum_usage_cost(predictions_path) -> float:
+    """Mirrors eval/runner.py's helper of the same name — both the batch eval and this
+    live API draw against the same DeepSeek account balance, so the API's spend
+    tracker must seed from whatever the eval runs have already spent."""
+    if not predictions_path.exists():
+        return 0.0
+    total = 0.0
+    with predictions_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                total += json.loads(line).get("usage", {}).get("cost_usd", 0.0)
+    return total
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
@@ -61,19 +80,31 @@ async def lifespan(app: FastAPI):
         app.state.embedder, app.state.qdrant_client, settings.qdrant_collection
     )
     graph_retriever = GraphRetriever(
-        app.state.neo4j_driver, settings.neo4j_database, hop_depth=settings.hop_depth
+        app.state.neo4j_driver,
+        settings.neo4j_database,
+        hop_depth=settings.hop_depth,
+        max_seed_entity_degree=settings.max_seed_entity_degree,
     )
     hybrid_retriever = HybridRetriever(vector_retriever, graph_retriever, app.state.passage_lookup)
 
-    daily_tracker = DailyQuotaTracker(
-        settings.results_dir / "gemini_daily_quota.json", settings.gemini_rpd, model=settings.gemini_model
-    )
-    rpm_limiter = RpmLimiter(settings.gemini_rpm)
-    gemini_generator = GeminiGenerator(
-        settings.gemini_api_key, settings.gemini_model, rpm_limiter, daily_tracker
-    )
+    if settings.generation_backend == "deepseek":
+        # Seeds from both eval prediction files — this server, the GraphRAG eval, and
+        # the baseline eval all draw against the same DeepSeek account balance.
+        starting_cost = _sum_usage_cost(
+            settings.results_dir / "graphrag_predictions.jsonl"
+        ) + _sum_usage_cost(settings.results_dir / "baseline_predictions.jsonl")
+        spend_tracker = SpendTracker(settings.deepseek_generation_cost_ceiling_usd, starting_cost)
+        generator = DeepSeekGenerator(settings.deepseek_api_key, settings.deepseek_model, spend_tracker)
+    else:
+        daily_tracker = DailyQuotaTracker(
+            settings.results_dir / "gemini_daily_quota.json", settings.gemini_rpd, model=settings.gemini_model
+        )
+        rpm_limiter = RpmLimiter(settings.gemini_rpm)
+        generator = GeminiGenerator(
+            settings.gemini_api_key, settings.gemini_model, rpm_limiter, daily_tracker
+        )
 
-    app.state.langgraph_app = build_graphrag_app(hybrid_retriever, gemini_generator)
+    app.state.langgraph_app = build_graphrag_app(hybrid_retriever, generator)
     app.state.ingest_running = False
 
     yield
@@ -82,6 +113,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="GraphRAG API", lifespan=lifespan)
+
+# CORS is configured at app-construction time (not inside lifespan), so settings are
+# loaded once here too — see Settings.allowed_origins in config.py for the rationale.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=get_settings().allowed_origins,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
+)
 
 
 class QueryRequest(BaseModel):

@@ -1,9 +1,9 @@
-"""Async DeepSeek client wrapper: JSON-mode calls, usage/cost accounting, and the hard
-spend guard described in instructions.md (halt before exceeding DEEPSEEK_COST_CEILING_USD,
-default $2, rather than trusting the ~$1 estimate alone)."""
+"""Async DeepSeek client wrapper for Stage 1 extraction: JSON-mode calls, usage/cost
+accounting, and the hard spend guard described in instructions.md (halt before
+exceeding DEEPSEEK_COST_CEILING_USD, default $2, rather than trusting the ~$1 estimate
+alone). Shared cost/spend-guard infrastructure lives in graphrag.deepseek_common."""
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 
@@ -15,24 +15,16 @@ from tenacity import (
     wait_random_exponential,
 )
 
+from graphrag.deepseek_common import (
+    DEEPSEEK_BASE_URL,
+    DISABLE_THINKING,
+    CostCeilingExceeded,  # noqa: F401  (re-exported: existing callers import it from here)
+    SpendTracker,
+    compute_cost,
+)
 from graphrag.extraction.prompt import build_messages
 
 logger = logging.getLogger(__name__)
-
-DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-
-# Pricing confirmed against https://api-docs.deepseek.com/quick_start/pricing/ (2026-07-18)
-# for deepseek-v4-flash, USD per 1M tokens. Re-check before relying on this for budgeting
-# again if it's been a while — DeepSeek has changed pricing before.
-PRICE_PER_MTOK = {
-    "cache_hit_input": 0.0028,
-    "cache_miss_input": 0.14,
-    "output": 0.28,
-}
-
-
-class CostCeilingExceeded(RuntimeError):
-    """Raised when cumulative DeepSeek spend would exceed the configured ceiling."""
 
 
 class ExtractionFailed(RuntimeError):
@@ -46,45 +38,6 @@ class ExtractionFailed(RuntimeError):
     def __init__(self, message: str, usage: dict):
         super().__init__(message)
         self.usage = usage
-
-
-class SpendTracker:
-    """Thread/async-safe running total, seeded from any usage already logged on disk so
-    a resumed run doesn't reset the ceiling check to zero."""
-
-    def __init__(self, ceiling_usd: float, starting_cost_usd: float = 0.0):
-        self.ceiling_usd = ceiling_usd
-        self._cost = starting_cost_usd
-        self._lock = asyncio.Lock()
-
-    @property
-    def cost(self) -> float:
-        return self._cost
-
-    async def check_before_call(self) -> None:
-        if self._cost >= self.ceiling_usd:
-            raise CostCeilingExceeded(
-                f"Cumulative DeepSeek cost ${self._cost:.4f} has reached the "
-                f"${self.ceiling_usd:.2f} ceiling — halting before making another call."
-            )
-
-    async def add(self, cost_usd: float) -> None:
-        async with self._lock:
-            self._cost += cost_usd
-            if self._cost >= self.ceiling_usd:
-                logger.error(
-                    "DeepSeek cumulative cost $%.4f has reached the $%.2f ceiling.",
-                    self._cost,
-                    self.ceiling_usd,
-                )
-
-
-def compute_cost(cache_hit_tokens: int, cache_miss_tokens: int, output_tokens: int) -> float:
-    return (
-        cache_hit_tokens * PRICE_PER_MTOK["cache_hit_input"]
-        + cache_miss_tokens * PRICE_PER_MTOK["cache_miss_input"]
-        + output_tokens * PRICE_PER_MTOK["output"]
-    ) / 1_000_000
 
 
 class DeepSeekExtractor:
@@ -110,14 +63,7 @@ class DeepSeekExtractor:
             # JSON content, not hidden reasoning — this cap costs nothing unless a
             # passage actually needs it.
             max_tokens=4096,
-            # deepseek-v4-flash defaults to THINKING mode (hidden chain-of-thought before
-            # the visible answer) — confirmed against api-docs.deepseek.com/guides/
-            # thinking_mode. Left on, reasoning tokens can consume the entire max_tokens
-            # budget before any JSON is emitted, producing an empty completion with
-            # finish_reason="length" (observed on ~27% of calls in initial testing).
-            # Extraction needs a single structured JSON object, not reasoning, so it's
-            # explicitly disabled here.
-            extra_body={"thinking": {"type": "disabled"}},
+            extra_body=DISABLE_THINKING,
         )
 
     async def extract(self, title: str, text: str) -> tuple[dict, dict]:

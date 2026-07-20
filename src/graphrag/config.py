@@ -59,11 +59,23 @@ class Settings(BaseSettings):
     gemini_model: str = Field(default="gemma-4-31b-it")
     embed_model: str = Field(default="BAAI/bge-small-en-v1.5")
 
-    # --- Cost guard (Stage 1 / DeepSeek) --------------------------------------
+    # --- Cost guard (Stage 1 / DeepSeek extraction) ---------------------------
     deepseek_cost_ceiling_usd: float = Field(default=2.0)
     extraction_concurrency: int = Field(default=8)
 
-    # --- Gemini/Gemma rate limiting (Stages 5 & 7) ----------------------------
+    # --- Generation backend (Stages 5 & 7) ------------------------------------
+    # "deepseek": pay-per-use via the same DeepSeek account as extraction, no daily
+    #   request cap — chosen after Gemini/Gemma's free-tier daily quota made a full
+    #   1,000-question x 2-mode eval take multiple days; DeepSeek was empirically
+    #   estimated at ~$0.45 total for the same workload (see deepseek_common.py).
+    # "gemini": the original free-tier path (gemini_model, gemini_rpm/rpd below) —
+    #   still fully implemented in generation/gemini_client.py, just not the default.
+    # Both draw from the SAME account balance as Stage 1 extraction, so this ceiling is
+    # sized with that already-spent cost in mind, not just this stage in isolation.
+    generation_backend: str = Field(default="deepseek")
+    deepseek_generation_cost_ceiling_usd: float = Field(default=1.5)
+
+    # --- Gemini/Gemma rate limiting (Stages 5 & 7, only used if generation_backend="gemini") ---
     # These are informed estimates, not a confirmed ceiling — 20 rapid calls to
     # gemma-4-31b-it succeeded with no throttling, but that's a lower bound, not the
     # true cap (deliberately didn't burn further free-tier quota just to find the
@@ -79,9 +91,35 @@ class Settings(BaseSettings):
     top_k_vector: int = Field(default=5)
     top_k_final: int = Field(default=8)
     qdrant_collection: str = Field(default="graphrag_passages")
+    # Excludes generic "hub" entities (e.g. a bare year, a nationality adjective) from
+    # being used as graph-traversal seeds — found live at full corpus scale (41k+
+    # entities), where a couple of seed entities with degree ~40 caused a 2-hop
+    # traversal to stall for minutes per question. See GraphRetriever's docstring.
+    max_seed_entity_degree: int = Field(default=30)
+
+    # --- API / CORS ----------------------------------------------------------
+    # Comma-separated list of origins allowed to call this API directly from a browser.
+    # The primary frontend integration (web/src/app/api/query/route.ts) is a server-side
+    # proxy, which isn't subject to CORS at all — this exists as defense-in-depth and to
+    # support hitting the API directly (e.g. /docs) from a browser during development.
+    allowed_origins_raw: str = Field(
+        default="http://localhost:3000", validation_alias=AliasChoices("ALLOWED_ORIGINS")
+    )
+
+    @property
+    def allowed_origins(self) -> list[str]:
+        return [origin.strip() for origin in self.allowed_origins_raw.split(",") if origin.strip()]
 
     # --- Paths -------------------------------------------------------------
-    data_dir: Path = Field(default=DATA_DIR)
+    # REPO_ROOT/DATA_DIR are computed from this file's location, which only resolves
+    # correctly for an editable/source-tree install (the local .venv dev setup). Under
+    # a regular `pip install .` — exactly what the Dockerfile does — the package lands
+    # in site-packages, so that computation silently points at the wrong place (found
+    # live: a container's /query returned "corpus not loaded" even though corpus.jsonl
+    # was right there at /app/data, because DATA_DIR had resolved to
+    # /usr/local/lib/python3.11/data instead). The Dockerfile sets DATA_DIR=/app/data
+    # explicitly so a real deployment never depends on this fragile default at all.
+    data_dir: Path = Field(default=DATA_DIR, validation_alias=AliasChoices("DATA_DIR"))
 
     @property
     def corpus_path(self) -> Path:
