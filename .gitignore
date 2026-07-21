@@ -17,8 +17,17 @@ env/
 .env.*
 !.env.example
 
-# Data, checkpoints, results (regenerable / large — never committed)
-data/
+# Data, checkpoints, results (regenerable / large — never committed).
+# Note: a bare "data/" would exclude the directory itself, and git won't descend into
+# an excluded directory to apply a finer-grained negation below it — "data/*" excludes
+# each direct child individually instead, which is what makes the corpus.jsonl
+# exception below actually work.
+data/*
+# Except the pooled corpus: Railway/Render/etc. build from the pushed repo, not the
+# local filesystem, and the backend's Dockerfile COPYs this in (needed at startup for
+# passage-text lookup) — small (a few MB), and it's ingestion's source of truth, not a
+# build artifact like the rest of data/.
+!data/corpus.jsonl
 
 # Testing / coverage
 .pytest_cache/
