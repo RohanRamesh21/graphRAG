@@ -92,7 +92,7 @@ confirmed to require no credit card.
 |---|---|---|
 | `GRAPHRAG_API_URL` | Vercel (frontend project) | Server-only, no `NEXT_PUBLIC_` prefix |
 | `DEEPSEEK_API_KEY` | Backend host | Generation + (already-run) extraction |
-| `NEO4J_URI` / `NEO4J_USERNAME` / `NEO4J_PASSWORD` | Backend host | Aura connection |
+| `NEO4J_URI` / `NEO4J_USERNAME` / `NEO4J_PASSWORD` / `NEO4J_DATABASE` | Backend host | Aura connection — `NEO4J_DATABASE` defaults to `"neo4j"` if unset, which broke a real deploy where the actual Aura instance uses a different database name (error: `GqlError 22N51 ... graph reference with the name 'neo4j' was not found`) |
 | `QDRANT_URL` / `QDRANT_API_KEY` | Backend host | Qdrant Cloud connection |
 | `ALLOWED_ORIGINS` | Backend host | Comma-separated; add the frontend's URL |
 
